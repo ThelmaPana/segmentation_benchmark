@@ -29,7 +29,12 @@ import lib.matching as matching
 ## Sets paths to data
 manual_dir = 'data/manual' # path to manual data dir
 reg_apeep_dir = 'data/regular_apeep_V2' # path to regular apeep data dir
-sem_apeep_dir = 'data/semantic_apeep' # path to semantic apeep data dir
+sem_apeep_dir = 'data/semantic_apeep_V6' # path to semantic apeep data dir
+
+## Output directory
+output_dir = 'data/manual/matches_900_04_400'
+os.makedirs(output_dir, exist_ok=True)
+
 
 # Initiate empty dict to store matches
 # with regular particles
@@ -56,7 +61,7 @@ man_segments = glob.glob(os.path.join(manual_dir, 'segmented', '*'))
 man_segments.sort()
 
 # Read ecotaxa export with objects taxo
-eco_exp = pd.read_csv('data/manual/ecotaxa_export.csv')
+eco_exp = pd.read_csv('data/manual/ecotaxa_export_test_set.csv')
 # rename colums
 eco_exp = eco_exp.rename(columns = {
     'object_id': 'eco_object_id',
@@ -105,10 +110,10 @@ for en, img_path in enumerate(man_segments):
         img_labelled = reg_mask, 
         img_name = img_name.replace('.png',''), 
         sample_id = '', 
-        props = ['label', 'bbox']
+        props = ['label', 'bbox', 'area']
     )
     # drop useless columns
-    reg_particles_props = reg_particles_props[['object_id', 'acq_id', 'object_label', 'object_bbox-0', 'object_bbox-1', 'object_bbox-2', 'object_bbox-3']]
+    reg_particles_props = reg_particles_props[['object_id', 'acq_id', 'object_label', 'object_bbox-0', 'object_bbox-1', 'object_bbox-2', 'object_bbox-3', 'object_area']]
     # add to all regular particles props
     all_reg_particles_props = pd.concat([all_reg_particles_props, reg_particles_props])
    
@@ -122,10 +127,10 @@ for en, img_path in enumerate(man_segments):
         img_labelled = sem_mask, 
         img_name = img_name.replace('.png',''), 
         sample_id = '', 
-        props = ['label', 'bbox']
+        props = ['label', 'bbox', 'area']
     )
     # drop useless columns
-    sem_particles_props = sem_particles_props[['object_id', 'acq_id', 'object_label', 'object_bbox-0', 'object_bbox-1', 'object_bbox-2', 'object_bbox-3']]
+    sem_particles_props = sem_particles_props[['object_id', 'acq_id', 'object_label', 'object_bbox-0', 'object_bbox-1', 'object_bbox-2', 'object_bbox-3', 'object_area']]
     # add to all semantic particles props
     all_sem_particles_props = pd.concat([all_sem_particles_props, sem_particles_props])
 
@@ -204,15 +209,12 @@ for en, img_path in enumerate(man_segments):
 matches_reg = pd.DataFrame(matches_reg)
 matches_sem = pd.DataFrame(matches_sem)
 
-# Write all dataframes
+## Write all dataframes
 os.makedirs(os.path.join(manual_dir, 'matches'), exist_ok=True)
 # particles
-all_man_particles_props.to_csv(os.path.join(manual_dir, 'matches', 'man_particles_props.csv'), index = False)
-all_reg_particles_props.to_csv(os.path.join(manual_dir, 'matches', 'reg_particles_props.csv'), index = False)
-all_sem_particles_props.to_csv(os.path.join(manual_dir, 'matches', 'sem_particles_props.csv'), index = False)
+all_man_particles_props.to_csv(os.path.join(output_dir, 'man_particles_props.csv'), index = False)
+all_reg_particles_props.to_csv(os.path.join(output_dir, 'reg_particles_props.csv'), index = False)
+all_sem_particles_props.to_csv(os.path.join(output_dir, 'sem_particles_props.csv'), index = False)
 # matches
-matches_reg.to_csv(os.path.join(manual_dir, 'matches', 'matches_reg.csv'), index = False)
-matches_sem.to_csv(os.path.join(manual_dir, 'matches', 'matches_sem.csv'), index = False)
-
-
-
+matches_reg.to_csv(os.path.join(output_dir, 'matches_reg.csv'), index = False)
+matches_sem.to_csv(os.path.join(output_dir, 'matches_sem.csv'), index = False)

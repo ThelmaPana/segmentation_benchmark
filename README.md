@@ -25,4 +25,4 @@ Benchmark for `apeep` semantic segmentation and regular segmentation on ISIIS da
 - `03.matches_stats.Rmd`: compute global statistics (precision and recall), taxon recall and size class recall for both segmentations
 
 ## Results
-A benchmark report containing computed statistics is generated : `03.matches_stats.html`
+A benchmark report containing computed statistics is generated: `03.matches_stats.html`

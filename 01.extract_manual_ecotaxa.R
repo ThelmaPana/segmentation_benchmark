@@ -8,8 +8,13 @@
 library(tidyverse)
 library(ecotaxar)
 
+# Set output directory
+#output_dir <- "data/manual"
+output_dir <- "data_cc4/manual"
+
 # project number
-projid <- as.integer(4520)
+#projid <- as.integer(4520) # for CC7
+projid <- as.integer(4693) # for CC4 
 
 # connect to db
 db <- db_connect_ecotaxa()
@@ -34,7 +39,9 @@ obj <- tbl(db, "objects") %>%
   select(-classif_id)
 
 # write a csv 
-obj %>% write_csv(file = "data/manual/ecotaxa_export.csv")  
+obj %>% write_csv(file = file.path(output_dir, "ecotaxa_export_test_set.csv"))  
 
 # disconnect from db
 db_disconnect_ecotaxa(db)
+
+
