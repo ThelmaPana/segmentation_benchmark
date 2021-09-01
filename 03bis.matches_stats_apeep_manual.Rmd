@@ -122,7 +122,7 @@ counts_taxo <- matches_reg %>%
 recall_taxo <- man_parts %>% 
   # count true particles per taxon
   count(taxon, name = "n_truth") %>% 
-  # join with semantic matched particles
+  # join with matched particles
   left_join(counts_taxo, by = "taxon") %>% 
   # compute ratio of apeep matched particles over true particles (recall)
   mutate(recall= n_reg / n_truth) %>% 
@@ -194,7 +194,7 @@ counts_size <- matches_reg %>%
 recall_size <- man_parts %>% 
   # count true particles per class size
   count(class_size, name = "n_truth") %>% 
-  # join with semantic matched particles
+  # join with matched particles
   left_join(counts_size, by = "class_size") %>% 
   # compute ratio of apeep matched particles over true particles (recall)
   mutate(recall = n_reg / n_truth) 
@@ -223,7 +223,6 @@ recall_size %>%
 
 ```
 
-**Semantic segmentation is less performant on small (< 50 px) classes.**
 
 
 Now compute precision on each size class.
@@ -250,7 +249,7 @@ counts_size <- matches_reg %>%
 precision_size <- reg_parts %>% 
   # count true particles per class size
   count(class_size, name = "n_reg") %>% 
-  # join with semantic matched particles
+  # join with matched particles
   left_join(counts_size, by = "class_size") %>% 
   # compute ratio of apeep matched particles over true particles (recall)
   mutate(precision = n_match / n_reg) %>% 
