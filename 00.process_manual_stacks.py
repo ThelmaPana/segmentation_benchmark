@@ -27,8 +27,8 @@ min_area = 50
 alpha_threshold = 100
 
 ## Read from apeep config file for regular segmentation
-#project_dir = 'data/regular_apeep'
-project_dir = 'data_cc4/apeep_cc4_er2' # Apeep directory
+project_dir = 'data/regular_apeep'
+#project_dir = 'data_cc4/apeep_cc4_er2' # Apeep directory
 cfg = configure.configure(project_dir)
 transect_name = cfg['io']['input_dir'].split('/')[-1] if len(cfg['io']['input_dir'].split('/')[-1]) > 0 else cfg['io']['input_dir'].split('/')[-2]
 #transect_name = 'cc4'
@@ -36,8 +36,8 @@ img_width = 2048
 
 ## Manual data
 # path to manual data dir
-#manual_dir = 'data/manual'
-manual_dir = 'data_cc4/manual'
+manual_dir = 'data/manual'
+#manual_dir = 'data_cc4/manual'
 # path to manual stacks
 stack_image_dir = os.path.join(manual_dir, 'manual_stacks')
 # list of manual stacks to process

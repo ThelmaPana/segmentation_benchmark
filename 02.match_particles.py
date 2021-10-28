@@ -28,11 +28,11 @@ import lib.matching as matching
 
 ## Sets paths to data
 manual_dir = 'data/manual' # path to manual data dir
-reg_apeep_dir = 'data/regular_apeep_V2' # path to regular apeep data dir
-sem_apeep_dir = 'data/semantic_apeep_V6' # path to semantic apeep data dir
+reg_apeep_dir = 'data/regular_apeep_def' # path to regular apeep data dir
+sem_apeep_dir = 'data/semantic_apeep_def' # path to semantic apeep data dir
 
 ## Output directory
-output_dir = 'data/manual/matches_900_04_400'
+output_dir = 'data/manual/matches_def'
 os.makedirs(output_dir, exist_ok=True)
 
 
@@ -218,3 +218,4 @@ all_sem_particles_props.to_csv(os.path.join(output_dir, 'sem_particles_props.csv
 # matches
 matches_reg.to_csv(os.path.join(output_dir, 'matches_reg.csv'), index = False)
 matches_sem.to_csv(os.path.join(output_dir, 'matches_sem.csv'), index = False)
+
