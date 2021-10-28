@@ -119,7 +119,7 @@ obj %>%
 ## Save particle properties ----
 #--------------------------------------------------------------------------#
 # write a csv 
-obj %>% write_csv(file = file.path(output_dir, "ecotaxa_export_test_set.csv"))  
+obj %>% write_csv(file = file.path(output_dir, "02.ecotaxa_export_test_set.csv"))  
 
 
 

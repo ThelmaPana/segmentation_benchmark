@@ -32,7 +32,7 @@ reg_apeep_dir = 'data/regular_apeep_def' # path to regular apeep data dir
 sem_apeep_dir = 'data/semantic_apeep_def' # path to semantic apeep data dir
 
 ## Output directory
-output_dir = 'data/manual/matches_def'
+output_dir = 'data/matches'
 os.makedirs(output_dir, exist_ok=True)
 
 
@@ -210,7 +210,6 @@ matches_reg = pd.DataFrame(matches_reg)
 matches_sem = pd.DataFrame(matches_sem)
 
 ## Write all dataframes
-os.makedirs(os.path.join(manual_dir, 'matches'), exist_ok=True)
 # particles
 all_man_particles_props.to_csv(os.path.join(output_dir, 'man_particles_props.csv'), index = False)
 all_reg_particles_props.to_csv(os.path.join(output_dir, 'reg_particles_props.csv'), index = False)
