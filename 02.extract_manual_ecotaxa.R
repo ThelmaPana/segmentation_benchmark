@@ -7,9 +7,13 @@
 
 library(tidyverse)
 library(ecotaxar)
+library(googlesheets4)
 library(reticulate)
 library(parallel)
+library(data.tree)
 
+gs4_auth(use_oob = TRUE)
+1
 
 # Set output directory
 output_dir <- "data/manual"
@@ -17,6 +21,8 @@ output_dir <- "data/manual"
 
 n_cores <- 12
 
+# link to aggregation spreadsheet
+ss <- "https://docs.google.com/spreadsheets/d/10DbIrieAvBjVuB3Ub_gZoIqdOYVJJ3SaCvinsBghjMM/edit?usp=sharing"
 
 ## Extract particles from ecotaxa ----
 #--------------------------------------------------------------------------#
@@ -25,9 +31,9 @@ projid <- as.integer(4520) # for CC7
 #projid <- as.integer(4693) # for CC4 
 
 # connect to db
-db <- db_connect_ecotaxa()
+db <- db_connect_ecotaxa(host="ecotaxa.obs-vlfr.fr", dbname="ecotaxa", user="zoo", password="z004ecot@x@")
 
-# get project
+# get project, samples and acquisitions
 projects <- tbl(db, "projects") %>% filter(projid %in% !!projid) %>% select(projid, mappingobj) %>% collect()
 
 # get taxo
@@ -49,8 +55,11 @@ obj <- tbl(db, "objects") %>%
 # disconnect from db
 db_disconnect_ecotaxa(db)
 
-# ignore objects which are detritus or othertocheck
-obj <- obj %>% filter(!taxon %in% c("detritus", "othertocheck"))
+
+## Compute bbox diagonal ----
+#--------------------------------------------------------------------------#
+obj <- obj %>% 
+  mutate(diag_bbox = sqrt((bbox2 - bbox0)^2 + (bbox3 - bbox1)^2))
 
 
 ## Compute particles position in avi files ----
@@ -59,7 +68,7 @@ obj <- obj %>% filter(!taxon %in% c("detritus", "othertocheck"))
 # Do this with pandas
 
 # List all tar archives
-tar_files <- list.files(path = "data/regular_apeep_def/particles/", pattern = ".tar", full.names = TRUE, recursive = TRUE)
+tar_files <- list.files(path = "data/regular_apeep/particles/", pattern = ".tar", full.names = TRUE, recursive = TRUE)
 
 # Import python package
 pd <- import("pandas")
@@ -116,11 +125,72 @@ obj %>%
   xlim(0, 10240) + ylim(0, 2048)
 
 
+## Build the tree ----
+#--------------------------------------------------------------------------#
+tc <- count(obj, taxon, lineage) %>% 
+  # convert it into a tree
+  rename(pathString=lineage) %>%
+  arrange(pathString) %>%
+  as.Node()
+
+print(tc, "taxon","n", limit = 50)
+# Convert to dataframe
+tcd <- ToDataFrameTree(tc, "taxon", "n")%>% 
+  as_tibble() %>% 
+  rename(level0=taxon, nb_level0=n)
+
+
+## Write tree into GSS ----
+#--------------------------------------------------------------------------#
+# Start by erasing previous data (3 first columns) in spreadsheet
+range_flood(ss, sheet = "tcd", range = "tcd!A:C", reformat = FALSE)
+# Write new tree
+range_write(ss, data = tcd) 
+# Open it in browser tab to make sure everything is ok
+gs4_browse(ss)
+
+
+## Read tree count from Google Spread Sheet (GSS) and create table for taxonomy match ----
+#--------------------------------------------------------------------------#
+tcd <- read_sheet(ss)
+
+# Get match between level0 (EcoTaxa taxonomy), level1 (taxonomy to use for classif) and level2 (ecological group)
+taxo_match <- tcd %>% 
+  select(level0, level1, plankton) %>% 
+  mutate(plankton = as.logical(plankton)) %>% 
+  drop_na(level0)
+
+# Raise an error if any line has missing taxa
+stopifnot("At least one taxa is not associated with others" = !any(is.na(taxo_match)))
+
+
+## Match taxonomy between EcoTaxa export and taxonomy to use ----
+#--------------------------------------------------------------------------#
+obj <- obj %>% 
+  rename(level0=taxon) %>% 
+  left_join(taxo_match, by = "level0") %>% 
+  select(-level0) %>% 
+  rename(taxon = level1) %>% 
+  select(-c(lineage, plankton))
+
+# Ignore objects in detritus or other_living
+obj <- obj %>% filter(!taxon %in% c("detritus", "other_living"))
+
+
+## Plot distribution per taxa ----
+#--------------------------------------------------------------------------#
+obj %>% 
+  count(taxon) %>% 
+  arrange(n) %>% 
+  mutate(taxon = factor(taxon, levels = unique(taxon))) %>% 
+  ggplot() +
+  geom_col(aes(y = taxon, x = n)) 
+
+length(unique(obj$taxon))
+
+
 ## Save particle properties ----
 #--------------------------------------------------------------------------#
 # write a csv 
 obj %>% write_csv(file = file.path(output_dir, "02.ecotaxa_export_test_set.csv"))  
-
-
-
 

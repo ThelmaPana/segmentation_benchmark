@@ -9,16 +9,16 @@
 #--------------------------------------------------------------------------#
 
 
-# 1. look for bbox intersection 
-# 2. look for mask overlap
 
 import os
 import glob
 import pandas as pd
 import numpy as np
+import math
 import cv2
 import matplotlib.pyplot as plt
 import skimage.measure
+import tarfile
 
 import lib.measure as measure
 import lib.im_opencv as im
@@ -28,11 +28,11 @@ import lib.matching as matching
 
 ## Sets paths to data
 manual_dir = 'data/manual' # path to manual data dir
-reg_apeep_dir = 'data/regular_apeep_def' # path to regular apeep data dir
-sem_apeep_dir = 'data/semantic_apeep_def' # path to semantic apeep data dir
+reg_apeep_dir = 'data/regular_apeep' # path to regular apeep data dir
+sem_apeep_dir = 'data/semantic_apeep' # path to semantic apeep data dir
 
 ## Output directory
-output_dir = 'data/matches'
+output_dir = 'data/matches_bbox'
 os.makedirs(output_dir, exist_ok=True)
 
 
@@ -42,12 +42,14 @@ matches_reg = {
     'img_name': [],
     'man_ids': [],
     'reg_ids': [],
+    'bbox_iou': [],
 }
 # with semantic particles
 matches_sem = {
     'img_name': [],
     'man_ids': [],
     'sem_ids': [],
+    'bbox_iou': [],
 }
 
 # Initiate empty dataframes to store all particles props
@@ -61,16 +63,16 @@ man_segments = glob.glob(os.path.join(manual_dir, 'segmented', '*'))
 man_segments.sort()
 
 # Read ecotaxa export with objects taxo
-eco_exp = pd.read_csv('data/manual/ecotaxa_export_test_set.csv')
+eco_exp = pd.read_csv('data/manual/02.ecotaxa_export_test_set.csv')
 # rename colums
 eco_exp = eco_exp.rename(columns = {
-    'object_id': 'eco_object_id',
+    'object_id': 'object_id',
     'img_name': 'acq_id',
     'bbox0': 'object_bbox-0',
     'bbox1': 'object_bbox-1',
     'bbox2': 'object_bbox-2',
     'bbox3': 'object_bbox-3'
-})
+}).drop('area', axis=1)
 
 
 
@@ -86,7 +88,9 @@ for en, img_path in enumerate(man_segments):
     ## Manual particles
     # read manual mask
     man_mask = im.read_mask(img_path)
-    # extract particles and their properties
+    
+    #man_particles_props = eco_exp[eco_exp['acq_id'] == img_name.replace('.png','')].reset_index(drop = True)
+    ## extract particles and their properties
     man_particles, man_particles_props = measure.measure(
         img = back, 
         img_labelled = man_mask, 
@@ -95,13 +99,12 @@ for en, img_path in enumerate(man_segments):
         props = ['label', 'bbox', 'area']
     )
     # drop useless columns
-    man_particles_props = man_particles_props[['object_id', 'acq_id', 'object_label', 'object_bbox-0', 'object_bbox-1', 'object_bbox-2', 'object_bbox-3', 'object_area']]
+    man_particles_props = man_particles_props[['acq_id', 'object_label', 'object_bbox-0', 'object_bbox-1', 'object_bbox-2', 'object_bbox-3', 'object_area']]
     # join with ecotaxa taxonomy based on bbox and acq_id (image name)
-    man_particles_props = man_particles_props.merge(eco_exp).drop('eco_object_id', axis=1)
+    man_particles_props = man_particles_props.merge(eco_exp)
     # add to all manual particles props
     all_man_particles_props = pd.concat([all_man_particles_props, man_particles_props])
     
-    ## Regular apeep particles
     # read regular apeep mask
     reg_mask = im.read_mask(os.path.join(reg_apeep_dir, 'segmented', img_name))
     # extract particles and their properties
@@ -112,9 +115,12 @@ for en, img_path in enumerate(man_segments):
         sample_id = '', 
         props = ['label', 'bbox', 'area']
     )
+    # compute bbox diagonal
+    reg_particles_props['diag_bbox'] = np.sqrt((reg_particles_props['object_bbox-2'] - reg_particles_props['object_bbox-0'])**2 + \
+    (reg_particles_props['object_bbox-3'] - reg_particles_props['object_bbox-1'])**2)
     # drop useless columns
-    reg_particles_props = reg_particles_props[['object_id', 'acq_id', 'object_label', 'object_bbox-0', 'object_bbox-1', 'object_bbox-2', 'object_bbox-3', 'object_area']]
-    # add to all regular particles props
+    reg_particles_props = reg_particles_props[['object_id', 'acq_id', 'object_label', 'object_bbox-0', 'object_bbox-1', 'object_bbox-2', 'object_bbox-3', 'object_area', 'diag_bbox']]
+    ## add to all regular particles props
     all_reg_particles_props = pd.concat([all_reg_particles_props, reg_particles_props])
    
 
@@ -129,8 +135,11 @@ for en, img_path in enumerate(man_segments):
         sample_id = '', 
         props = ['label', 'bbox', 'area']
     )
+    # compute bbox diagonal
+    sem_particles_props['diag_bbox'] = np.sqrt((sem_particles_props['object_bbox-2'] - sem_particles_props['object_bbox-0'])**2 + \
+    (sem_particles_props['object_bbox-3'] - sem_particles_props['object_bbox-1'])**2)
     # drop useless columns
-    sem_particles_props = sem_particles_props[['object_id', 'acq_id', 'object_label', 'object_bbox-0', 'object_bbox-1', 'object_bbox-2', 'object_bbox-3', 'object_area']]
+    sem_particles_props = sem_particles_props[['object_id', 'acq_id', 'object_label', 'object_bbox-0', 'object_bbox-1', 'object_bbox-2', 'object_bbox-3', 'object_area', 'diag_bbox']]
     # add to all semantic particles props
     all_sem_particles_props = pd.concat([all_sem_particles_props, sem_particles_props])
 
@@ -163,16 +172,16 @@ for en, img_path in enumerate(man_segments):
             
             # check for bbox intercept
             bbox_intersect = matching.check_bbox_overlap(man_bb, reg_bb)
-            if bbox_intersect:                
-                # if bbox intersect, check for mask overlap
-                mask_overlap = np.any((man_mask == man_label) & (reg_mask == reg_label))
-                
-                if mask_overlap:
-                    # if masks do overlap, save particles ids
-                    matches_reg['img_name'].append(img_name.replace('.png',''))
-                    matches_reg['man_ids'].append(man_id)
-                    matches_reg['reg_ids'].append(reg_id)
-                    
+            
+            # compute bbox iou
+            bbox_iou = matching.bbox_iou(man_bb, reg_bb)
+            
+            if bbox_iou > 0.1 :  
+                # if bbox iou is > 0.1, save particles ids
+                matches_reg['img_name'].append(img_name.replace('.png',''))
+                matches_reg['man_ids'].append(man_id)
+                matches_reg['reg_ids'].append(reg_id)
+                matches_reg['bbox_iou'].append(bbox_iou)
                     
         ## Look for match with semantic particles
         # loop over semantic particles 
@@ -189,15 +198,16 @@ for en, img_path in enumerate(man_segments):
             
             # check for bbox intercept
             bbox_intersect = matching.check_bbox_overlap(man_bb, sem_bb)
-            if bbox_intersect:  
-                # if bbox intersect, check for mask overlap
-                mask_overlap = np.any((man_mask == man_label) & (sem_mask == sem_label))
-                
-                if mask_overlap:
-                    # if masks do overlap, save particles ids
-                    matches_sem['img_name'].append(img_name.replace('.png',''))
-                    matches_sem['man_ids'].append(man_id)
-                    matches_sem['sem_ids'].append(sem_id)
+            
+            # compute bbox iou
+            bbox_iou = matching.bbox_iou(man_bb, sem_bb)
+
+            if bbox_iou > 0.1 :  
+                # if bbox iou is > 0.1, save particles ids
+                matches_sem['img_name'].append(img_name.replace('.png',''))
+                matches_sem['man_ids'].append(man_id)
+                matches_sem['sem_ids'].append(sem_id)
+                matches_sem['bbox_iou'].append(bbox_iou)
     
     # Progress flag
     print(f'{img_name} done')
@@ -209,6 +219,9 @@ for en, img_path in enumerate(man_segments):
 matches_reg = pd.DataFrame(matches_reg)
 matches_sem = pd.DataFrame(matches_sem)
 
+# reorder columns in manual properties
+all_man_particles_props = all_man_particles_props.reindex(columns=(['object_id'] + list([a for a in all_man_particles_props.columns if a != 'object_id']) ))
+
 ## Write all dataframes
 # particles
 all_man_particles_props.to_csv(os.path.join(output_dir, 'man_particles_props.csv'), index = False)
@@ -217,4 +230,7 @@ all_sem_particles_props.to_csv(os.path.join(output_dir, 'sem_particles_props.csv
 # matches
 matches_reg.to_csv(os.path.join(output_dir, 'matches_reg.csv'), index = False)
 matches_sem.to_csv(os.path.join(output_dir, 'matches_sem.csv'), index = False)
+
+
+
 

@@ -4,33 +4,138 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, fig.width=10, fig.height=6)
+knitr::opts_chunk$set(echo = TRUE, fig.width=10, fig.height=6, message = FALSE)
 library(tidyverse)
 library(scales)
+library(gghalves)
+library(lubridate)
+library(parallel)
+library(ggtext)
 ```
 
-The purpose of this script is to compare the performances of two segmentation pipelines against a ground truth human segmentation, on 106 large `apeep` images (10240 px * 2048 px).  
-The first pipeline (`regular segmentation`) is an adaptive gray level segmentation, down to 50 px.  
-The second pipeline (`semantic segmentation`) is a combination of:  
+The purpose of this script is to compare the performances of three segmentation pipelines against a ground truth human segmentation, on 106 large `apeep` images (10240 px * 2048 px).  
+The first pipeline (`threshold-based`, also called `regular` in the code) is an adaptive gray level segmentation, down to 50 px.  
+The second pipeline (`T-CNN`, also called `semantic` in the code) is a combination of:  
 
-* an adaptive gray level segmentation for large particles (> 400 px)
-* a semantic bbox proposal followed by the same gray level segmentation for small particles (50 px - 400 px) 
+* an adaptive gray level segmentation for large particles (> 400 px in area)
+* a CNN-based bbox proposal followed by the same gray level segmentation for small particles (50 px - 400 px in area) 
 
-
+The third pipeline (`MSER`) is based on maximally stable extremal regions.
 
 ## Prepare data
 ### Read data
 
 
 ```{r read_data}
-output_dir <- "data/manual/matches_def"
+output_dir <- "data/matches_bbox"
 
-man_parts <- read_csv(file.path(output_dir, "man_particles_props.csv"), col_types = cols()) %>% select(-c("object_label", "object_bbox-0", "object_bbox-1", "object_bbox-2", "object_bbox-3"))
-reg_parts <- read_csv(file.path(output_dir, "reg_particles_props.csv"), col_types = cols()) %>% select(-c("object_label", "object_bbox-0", "object_bbox-1", "object_bbox-2", "object_bbox-3"))
-sem_parts <- read_csv(file.path(output_dir, "sem_particles_props.csv"), col_types = cols()) %>% select(-c("object_label", "object_bbox-0", "object_bbox-1", "object_bbox-2", "object_bbox-3"))
+# Particles properties
+man_parts <- read_csv(file.path(output_dir, "man_particles_props.csv"), col_types = cols()) %>% select(-c("object_label", "object_bbox-0", "object_bbox-1", "object_bbox-2", "object_bbox-3")) %>% rename(area = object_area) %>% mutate(diag_bbox_um = diag_bbox / 51, .after = diag_bbox)
+reg_parts <- read_csv(file.path(output_dir, "reg_particles_props.csv"), col_types = cols()) %>% select(-c("object_label", "object_bbox-0", "object_bbox-1", "object_bbox-2", "object_bbox-3")) %>% rename(area = object_area) %>% mutate(diag_bbox_um = diag_bbox / 51)
+sem_parts <- read_csv(file.path(output_dir, "sem_particles_props.csv"), col_types = cols()) %>% select(-c("object_label", "object_bbox-0", "object_bbox-1", "object_bbox-2", "object_bbox-3")) %>% rename(area = object_area) %>% mutate(diag_bbox_um = diag_bbox / 51)
+mser_parts <- read_csv("data/mser/mser_measurements.csv", col_types = cols()) %>% 
+    mutate(
+    diag_bbox = sqrt((x2 - x1)^2 + (y2 - y1)^2),
+    diag_bbox_um = diag_bbox / 51
+  ) %>% 
+  select(object_id = image, area = area, diag_bbox, diag_bbox_um)
 
+# Matches
 matches_reg <- read_csv(file.path(output_dir, "matches_reg.csv"), col_types = cols())
 matches_sem <- read_csv(file.path(output_dir, "matches_sem.csv"), col_types = cols())
+matches_mser <- read_csv("data/mser/mser_matches.csv", col_types = cols()) %>% rename(man_ids = manual_particle_id, mser_ids = mser_particle_id, bbox_iou = bbox_iou_value)
+
+```
+
+Join manual particles with metadata (lat, lon, depth…). This will be necessary to define an inshore zone (distance from shore < 20 km) and an offshore zone (distance from shore > 40 km).
+
+```{r join_env}
+# Load metadata
+load("data/01.env_meta.Rdata")
+env_meta <- env_meta %>% filter(transect == "cross_current_07")
+
+# Compute manual particles datetime from image name and join with environmental data
+man_parts <- man_parts %>% 
+  mutate(
+    date = str_split_fixed(acq_id, "_", n=3)[,1], # get date
+    time = str_split_fixed(acq_id, "_", n=3)[,2], # get time
+    time = str_replace_all(time, "-", ":"),
+    milli = str_split_fixed(acq_id, "_", n=3)[,3], # get milliseconds
+    time = paste(time, milli, sep = "."),
+    datetime = paste(date, time), # recreate datetime from date and time
+    datetime = ymd_hms(datetime, tz = "Europe/Paris"), # convert to datetime object with appropriate timezone
+  ) %>% 
+  select(-c(date, time, milli)) %>% 
+  mutate(datetime = round_date(datetime)) %>% # Round datetime to s to join with env data
+  left_join(env_meta, by = "datetime")
+
+# Plankton data sampling is more regular than env data: multiples points per second for plankton data 
+# while env and metadata were not recorded at every second.
+# Fill gaps for yo, yo_type and period 
+# Interpolate with extrapolation by yo for lat, lon, depth and dist
+man_parts <- man_parts %>% 
+  # Fill yo, yo_type and period
+  fill(yo, .direction = "downup") %>% 
+  fill(yo_type, .direction = "downup") %>% 
+  fill(period, .direction = "downup") %>% 
+  mutate(yo = as.numeric(yo))
+
+## Interpolate env data on predictions datetime
+# List variables to interpolate
+variables <- c("depth", "dist", "lon", "lat")
+
+# Run parallel interpolation
+intl <- mclapply(unique(man_parts$yo), function(id) {
+  
+  # Initiate empty tibble for this profile
+  yo_int <- tibble()
+  
+  # Datetime to interpolate
+  ci <- man_parts %>% select(-all_of(variables)) %>% filter(yo == id) %>% mutate(rank=seq(1,n()))
+  
+  # Loop over variables to interpolate
+  for (my_var in variables){
+    # Compute interpolation
+    # Available data
+    wi <- env_meta %>% filter(yo == id) %>% select(datetime, all_of(my_var))
+    
+    # Run interpolation
+    cint <- ci %>% 
+      mutate(
+        value = castr::interpolate(x=wi$datetime, y=pull(wi[my_var]) , xo=ci$datetime, extrapolate = TRUE), #TODO check extrapolation consequences
+        variable = my_var
+      ) %>% 
+      spread(variable, value) %>% 
+      select(-rank)
+    
+    # Join to table with other variables
+    if (length(yo_int) == 0) { # If first interpolated variable on this profile
+      yo_int <- cint # Replace transect table by newly computed interpolation
+    } else { # Else perform a left join with previously interpolated variables
+      yo_int <- bind_cols(yo_int, cint %>% select(all_of(my_var)))
+    } 
+  }
+  return(yo_int)
+}, mc.cores=12) 
+# this returns a list, recombine it into a tibble
+man_parts <- do.call(bind_rows, intl) %>% # This tibble contains interpolated metadata data for predictions
+  select(-transect) %>% 
+  mutate(yo = as.factor(yo))
+
+```
+
+Get large image name for MSER particles.
+
+```{r mser_img_name}
+img_ids <- man_parts %>% 
+  select(avi_file, acq_id) %>% 
+  unique()
+
+mser_parts <- mser_parts %>% 
+  mutate(avi_file = str_split_fixed(object_id, "_", n = 3)[,1]) %>% 
+  left_join(img_ids, by = "avi_file") %>% 
+  select(object_id, acq_id, area, diag_bbox)
+
 ```
 
 
@@ -39,24 +144,57 @@ matches_sem <- read_csv(file.path(output_dir, "matches_sem.csv"), col_types = co
 Make a list of taxa in manually segmented particles.
 
 ```{r taxa}
-taxa <- man_parts %>% pull(taxon) %>% unique() %>% sort()
-taxa
+taxa <- man_parts %>% 
+  select(taxon) %>% 
+  unique() %>% 
+  arrange(taxon) %>% 
+  mutate(
+    nice_taxon = str_replace_all(taxon, "_", " "),
+    nice_taxon = ifelse(nice_taxon %in% c("Rhizaria", "Cnidaria", "Crustacea"), paste("other", nice_taxon), nice_taxon),
+    nice_taxon = ifelse(str_detect(nice_taxon, "pluteus"), "Echinoderm. pluteus", nice_taxon),
+    nice_taxon = ifelse(str_detect(nice_taxon, "Collodaria"), paste(str_split_fixed(nice_taxon, " ", n = 2)[,2], str_split_fixed(nice_taxon, " ", n = 2)[,1]), nice_taxon)
+    )
 ```
 
 The manual segmentation originally generated `r nrow(man_parts)` particles.
 We will ignore objects in the `detritus` and `othertocheck` categories as well as objects smaller than 50 px.
 
+Moreover, matches of `MSER` particles was done before manual particles were more strictly inspected, thus `matches_mser` may contain matches with manual particles which are not to consider anymore. This step also cures this problem.
+
 ```{r filter_objects}
 ignored <- man_parts %>% filter(taxon %in% c("detritus", "othertocheck")) %>% pull(object_id)
-small <- man_parts %>% filter(area < 50) %>% pull(object_id)
-man_parts <- man_parts %>% filter(!(taxon %in% c("detritus", "othertocheck"))) %>% filter(area >= 50)
+small <- man_parts %>% filter(area <= 50) %>% pull(object_id)
+man_parts <- man_parts %>% filter(!(taxon %in% c("detritus", "othertocheck"))) %>% filter(area > 50) %>% left_join(taxa)
 
-matches_sem <- matches_sem %>% filter((!(man_ids %in% ignored)) & (!(man_ids %in% small))) 
-matches_reg <- matches_reg %>% filter((!(man_ids %in% ignored)) & (!(man_ids %in% small))) 
+# Keep only matched particles present in manual particles
+matches_reg <- matches_reg %>% filter(man_ids %in% man_parts$object_id) 
+matches_sem <- matches_sem %>% filter(man_ids %in% man_parts$object_id) 
+matches_mser <- matches_mser %>% filter(man_ids %in% man_parts$object_id) 
 ```
 
 **After removing non living and small particles, `r nrow(man_parts)` manual particles are left.
-`r nrow(reg_parts)` particles were generated by regular segmentation and `r nrow(sem_parts)` particles (`r format(nrow(reg_parts) / nrow(sem_parts), digits = 3)` times less particles) for semantic segmentation on the same 106 images.**
+`r nrow(reg_parts)` particles were generated by threshold-based segmentation, `r nrow(sem_parts)` particles (`r format(nrow(reg_parts) / nrow(sem_parts), digits = 3)` times less particles) for T-CNN segmentation, and `r nrow(mser_parts)` particles (`r format(nrow(reg_parts) / nrow(mser_parts), digits = 3)` times less particles) for MSER segmentation on the same 106 images.**
+
+Compute the number of segmented particles for a deployment of 1 minute and 1 hour.
+
+```{r particles_rate}
+# number of processed pixels
+pix_processed <- 106*10240
+# number of pixels for 1 minute of ISIIS
+pix_minute <- 28000*60
+# number of pixels for 1 hour of ISIIS
+pix_hour <- 28000*60*60
+
+tibble(
+  segmentation = c("manual", "threshold-based", "T-CNN", "mser"),
+  n_parts = c(nrow(man_parts), nrow(reg_parts), nrow(sem_parts), nrow(mser_parts))
+  ) %>% 
+  mutate(
+    per_minute = n_parts * pix_minute / pix_processed,
+    per_hour = n_parts * pix_hour / pix_processed
+  ) #%>% as.data.frame() %>% format(scientific=TRUE)
+```
+
 
 Let’s inspect taxonomic composition of benchmark dataset.
 
@@ -71,71 +209,59 @@ man_parts %>%
   scale_y_continuous(trans = "log1p", breaks = c(0, 10, 50, 100, 200, 400, 1000, 2000)) +
   labs(x = "Taxon", y = "Object number", title = "Test set composition") + 
   theme(text = element_text(size = 16)) 
-  
 ```
 
-```{r testset_comp_small}
+And the size distribution of test set in terms of object area and bbox diagonal.
+
+```{r testset_size}
 man_parts %>% 
-  filter(object_area < 400) %>% 
-  count(taxon) %>% 
-  arrange(-n) %>% 
-  mutate(taxon = factor(taxon, taxon)) %>% 
   ggplot() +
-  geom_col(aes(x = taxon, y = n, fill = n > 10)) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  scale_y_continuous(trans = "log1p", breaks = c(0, 10, 50, 100, 200, 400, 1000, 2000)) +
-  labs(x = "Taxon", y = "Object number", title = "Test set composition for small objects (< 400 px)") + 
-  theme(text = element_text(size = 16)) 
-  
-```
-
-Have also a look at training set composition.
-
-```{r training_set}
-training_set <- read_csv("data/manual/ecotaxa_export_training_set.csv", col_types = cols()) %>% select(object_id, area, taxon)
-
-training_set %>% 
-  filter(area < 400) %>% 
-  count(taxon) %>% 
-  arrange(-n) %>% 
-  mutate(taxon = factor(taxon, taxon)) %>% 
-  ggplot() +
-  geom_col(aes(x = taxon, y = n, fill = n > 10)) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  scale_y_continuous(trans = "log1p", breaks = c(0, 10, 50, 100, 200, 400, 1000, 2000)) +
-  labs(x = "Taxon", y = "Object number", title = "Traning set composition for small objects (< 400 px)") + 
+  geom_histogram(aes(x = area), bins = 50) +
+  scale_x_log10() +
+  labs(x = "Object area", y = "Object number", title = "Test set size distribution (object area)") + 
   theme(text = element_text(size = 16)) 
 ```
 
-
+```{r testset_size_bbox}
+man_parts %>% 
+  ggplot() +
+  geom_histogram(aes(x = diag_bbox), bins = 50) +
+  scale_x_log10() +
+  labs(x = "Diagonal of bbox", y = "Object number", title = "Test set size distribution (bbox diagonal)") + 
+  theme(text = element_text(size = 16)) 
+```
 
 
 ## Compute global statistics
 Compute overall precision and recall:  
 
-* precision: among `apeep` particles, how many where matched with manual particles?
-* recall: among manual particles, how many where matched with `apeep` particles?
+* precision: among `automatic` particles, how many where matched with manual particles?
+* recall: among manual particles, how many where matched with `automatic` particles?
 
 ```{r global}
 # Precision
 # apeep particles matched with manual particles / apeep particles
 precision_reg <- length(unique(matches_reg$reg_ids)) / length(reg_parts$object_id)
 precision_sem <- length(unique(matches_sem$sem_ids)) / length(sem_parts$object_id)
+precision_mser <- length(unique(matches_mser$mser_ids)) / length(mser_parts$object_id)
 
 # Recall
 # manual particles matched with apeep particles / manual particles
 recall_reg <- length(unique(matches_reg$man_ids)) / length(man_parts$object_id)
 recall_sem <- length(unique(matches_sem$man_ids)) / length(man_parts$object_id)
+recall_mser <- length(unique(matches_mser$man_ids)) / length(man_parts$object_id)
 
+# Put this in a tibble
 global_stats <- tibble(
-  metric = c("precision", "precision", "recall", "recall"),
-  segmentation = c("regular", "semantic", "regular", "semantic"), 
-  value = c(precision_reg, precision_sem, recall_reg, recall_sem)
+  metric = c("precision", "precision", "precision", "recall", "recall", "recall"),
+  segmentation = c("regular", "semantic", "mser", "regular", "semantic", "mser"), 
+  value = c(precision_reg, precision_sem, precision_mser, recall_reg, recall_sem, recall_mser)
 )
-global_stats
+global_stats %>% 
+  spread(key = metric, value = value)
 ```
 
-Plot it
+And plot it
 
 ```{r global_plot, echo=FALSE}
 global_stats %>% 
@@ -144,23 +270,22 @@ global_stats %>%
   theme(text = element_text(size = 16)) 
 ```
 
-**Regular segmentation has a very good recall (`r percent(recall_reg, accuracy = 0.1)`) but a very poor precision (`r percent(precision_reg, accuracy = 0.1)`), performing classification on this huge number of particles will be difficult. Semantic segmentation extracts `r percent(recall_sem, accuracy = 0.1)` of relevant particles and only `r percent(1 - precision_sem, accuracy = 0.1)` of extracted particles are not relevant.**
+**Threshold-based segmentation has a very good recall (`r percent(recall_reg, accuracy = 0.1)`) but a very poor precision (`r percent(precision_reg, accuracy = 0.1)`), performing classification on this huge number of particles will be difficult. T-CNN segmentation extracts `r percent(recall_sem, accuracy = 0.1)` of relevant particles and only `r percent(1 - precision_sem, accuracy = 0.1)` of extracted particles are not relevant. MSER has intermediate performances in terms of precision, but a lower recall than T-CNN segmentation.**
 
 
 ## Compute statistics per taxon
 We want to compute the recall of organism per taxonomic group, but we have to deal with multiple matches.
 
-Case 1: one `apeep` particle matched with multiple manual particles, likely with two different taxo.
+Case 1: one `automatic` particle matched with multiple manual particles, likely with two different taxo.
 Two solutions:
 
 - take the rarest taxo
 - ignore particle as the CNN won’t be able to predict it (selected solution)
 
-Case 2: one manual particle matched with multiple `apeep` particles, only one taxo but `apeep` segmentation overestimates the number of organisms in this taxo. 
-
+Case 2: one manual particle matched with multiple `automatic` particles, only one taxo but `automatic` segmentation overestimates the number of organisms in this taxo. 
 Solution: keep only one match.
 
-```{r taxo_stats}
+```{r taxo_stats, fig.width=6, fig.height=15}
 ## Regular particles
 # Count matches 
 counts_reg_taxo <- matches_reg %>% 
@@ -203,168 +328,118 @@ recall_sem_taxo <- man_parts %>%
   # compute ratio of semantic matched particles over true particles (recall)
   mutate(recall_sem = n_sem / n_truth) 
 
+## MSER particles
+# Count matches 
+counts_mser_taxo <- matches_mser %>% 
+  # drop all cases of duplicated matches of apeep particles in match table (solve case 1 of multiple matches)
+  add_count(mser_ids) %>% filter(n==1) %>% select(-n) %>% 
+  # drop duplicates of matched manual particles and keep only one (solve case 2 of multiple matches)
+  distinct(man_ids, .keep_all = TRUE) %>% 
+  # join matched MSER particles with manual particles taxo
+  left_join(man_parts, by = c("man_ids" = "object_id")) %>% 
+  # count matches per taxon
+  count(taxon, name = "n_mser") 
+
+# Compute recall
+recall_mser_taxo <- man_parts %>% 
+  # count true particles per taxon
+  count(taxon, name = "n_truth") %>% 
+   # join with MSER matched particles
+  left_join(counts_mser_taxo, by = "taxon") %>%
+  # compute ratio of MSER matched particles over true particles (recall)
+  mutate(recall_mser = n_mser / n_truth) 
 
 # Join regular and semantic recall data and plot
 recall_taxo <- recall_reg_taxo %>% 
   left_join(recall_sem_taxo, by = c("taxon", "n_truth")) %>% 
+  left_join(recall_mser_taxo, by = c("taxon", "n_truth")) %>% 
   select(taxon, n_truth, contains("recall")) %>% 
   arrange(n_truth) %>% 
   #mutate(taxon = factor(taxon, levels = rev(taxon))) %>% 
   mutate(taxon = factor(taxon, taxon)) %>% 
-  gather(recall_reg:recall_sem, key = "segmentation", value = "recall") 
+  gather(recall_reg:recall_mser, key = "segmentation", value = "recall") 
 
-# Plot it
+
+taxo_size <- man_parts %>% 
+  group_by(taxon) %>% 
+  summarise(diag_bbox = mean(diag_bbox)) %>% 
+  ungroup()
+
+# Add number of objects to class label
+recall_taxo <- recall_taxo %>% 
+  left_join(taxa, by = "taxon") %>% 
+  mutate(
+  class_label = paste0(nice_taxon, "\nn=", n_truth),
+  class_label = factor(class_label, levels = unique(class_label))
+  ) 
+
+# Plot
+cols <- c(
+  "T" = "#66c2a5", # for threshold-based
+  "T-MSER" = "#fc8d62", # for MSER
+  "T-CNN" = "#8da0cb" # for T-CNN
+)
+
 recall_taxo %>% 
-  ggplot() +
-  geom_col(aes(x = taxon, y = n_truth, fill = recall), position = "dodge") +
-  scale_fill_viridis_c(direction = -1) + 
-  scale_y_continuous(trans = "log1p") +
-  coord_flip() +
-  facet_wrap(~segmentation,  labeller = as_labeller(c("recall_reg" = "Regular segmentation", "recall_sem" = "Semantic segmentation"))) +
-  labs(title = "Recall scores and organisms number per taxa for each segmentation", y = "Number of true objects") +
-  theme(text = element_text(size = 16)) 
-```
-
-Other plot 
-
-```{r taxo_plot, echo=FALSE}
-recall_taxo %>% 
-  ggplot() +
-  geom_col(aes(x = taxon, y = recall, fill = n_truth)) + 
-  scale_fill_viridis_c(trans = "log1p", direction = -1) + 
-  coord_flip() +
-  facet_wrap(~segmentation, labeller = as_labeller(c("recall_reg" = "Regular segmentation", "recall_sem" = "Semantic segmentation"))) +
-  labs(title = "Recall scores and organisms number per taxa for each segmentation", fill = "Number of \ntrue objects") +
-  theme(text = element_text(size = 16)) 
-
-```
-
-```{r recall_diff}
-recall_taxo %>% 
-  spread(key = segmentation, value = recall) %>% 
-  mutate(diff_recall = recall_reg - recall_sem) %>% 
-  ggplot() +
-  geom_col(aes(y = taxon, x = diff_recall))
-```
-Only six taxa are affected by a decrease of more than 10% in their recall.
-
-**Semantic segmentation is less performant on Bacillariophycaea (looks like fibers), like<Copepoda (blurred copepods) and Rhizaria (can be similar to small detritus).**
-
-Let’s focus only on objects smaller than 400 px.
-
-```{r taxo_stats_large}
-## Regular particles
-# Count matches 
-counts_reg_taxo <- matches_reg %>% 
-  # drop all cases of duplicated matches of apeep particles in match table (solve case 1 of multiple matches)
-  add_count(reg_ids) %>% filter(n==1) %>% select(-n) %>% 
-  # drop duplicates of matched manual particles and keep only one (solve case 2 of multiple matches)
-  distinct(man_ids, .keep_all = TRUE) %>% 
-  # join matched regular particles with manual particles taxo
-  left_join(man_parts, by = c("man_ids" = "object_id")) %>% 
-  # keep only particles smaller than 400 px
-  filter(area < 400) %>% 
-  # count matches per taxon
-  count(taxon, name = "n_reg") 
-
-# Compute recall
-recall_reg_taxo <- man_parts %>% 
-  # keep only particles smaller than 400 px
-  filter(area < 400) %>% 
-  # count true particles per taxon
-  count(taxon, name = "n_truth") %>% 
-  # join with semantic matched particles
-  left_join(counts_reg_taxo, by = "taxon") %>% 
-  # compute ratio of regular matched particles over true particles (recall)
-  mutate(recall_reg = n_reg / n_truth) 
-
-## Semantic particles
-# Count matches 
-counts_sem_taxo <- matches_sem %>% 
-  # drop all cases of duplicated matches of apeep particles in match table (solve case 1 of multiple matches)
-  add_count(sem_ids) %>% filter(n==1) %>% select(-n) %>% 
-  # drop duplicates of matched manual particles and keep only one (solve case 2 of multiple matches)
-  distinct(man_ids, .keep_all = TRUE) %>% 
-  # join matched semantic particles with manual particles taxo
-  left_join(man_parts, by = c("man_ids" = "object_id")) %>% 
-  # keep only particles smaller than 400 px
-  filter(area < 400) %>% 
-  # count matches per taxon
-  count(taxon, name = "n_sem") 
-
-# Compute recall
-recall_sem_taxo <- man_parts %>% 
-  # keep only particles smaller than 400 px
-  filter(area < 400) %>% 
-  # count true particles per taxon
-  count(taxon, name = "n_truth") %>% 
-   # join with semantic matched particles
-  left_join(counts_sem_taxo, by = "taxon") %>%
-  # compute ratio of semantic matched particles over true particles (recall)
-  mutate(recall_sem = n_sem / n_truth) 
-
-
-# Join regular and semantic recall data and plot
-recall_taxo <- recall_reg_taxo %>% 
-  left_join(recall_sem_taxo, by = c("taxon", "n_truth")) %>% 
-  select(taxon, n_truth, contains("recall")) %>% 
+  mutate(
+    segmentation = str_remove(segmentation, "recall_"),
+    segmentation = ifelse(segmentation == "reg", "T", ifelse(segmentation == "sem", "T-CNN", "T-MSER")),
+    segmentation = factor(segmentation, levels = c("T", "T-MSER", "T-CNN"))
+  ) %>% 
+  left_join(taxo_size, by = "taxon") %>% 
   arrange(n_truth) %>% 
-  mutate(taxon = factor(taxon, taxon)) %>% 
-  gather(recall_reg:recall_sem, key = "segmentation", value = "recall") %>% 
-  replace_na(list(recall = 0))
-
-# Plot it
-recall_taxo %>% 
+  mutate(taxon = factor(taxon, levels = unique(taxon))) %>% 
   ggplot() +
-  geom_col(aes(x = taxon, y = n_truth, fill = recall), position = "dodge") +
-  scale_fill_viridis_c(direction = -1) + 
-  scale_y_continuous(trans = "log1p") +
-  coord_flip() +
-  facet_wrap(~segmentation,  labeller = as_labeller(c("recall_reg" = "Regular segmentation", "recall_sem" = "Semantic segmentation"))) +
-  labs(title = "Recall scores and organisms number per taxa for each segmentation on small objects", y = "Number of true objects") +
-  theme(text = element_text(size = 16)) 
-```
-
-
-Other plot 
-
-```{r taxo_plot_large, echo=FALSE}
-recall_taxo %>% 
-  ggplot() +
-  geom_col(aes(x = taxon, y = recall, fill = n_truth)) + 
-  scale_fill_viridis_c(trans = "log1p", direction = -1) + 
-  coord_flip() +
-  facet_wrap(~segmentation, labeller = as_labeller(c("recall_reg" = "Regular segmentation", "recall_sem" = "Semantic segmentation"))) +
-  labs(title = "Recall scores and organisms number per taxa for each segmentation for small objects", fill = "Number of \ntrue objects") +
-  theme(text = element_text(size = 16)) 
+  geom_col(aes(y = taxon, x = recall, fill = factor(segmentation, levels = rev(levels(segmentation)))), position = "dodge") + 
+  #scale_fill_brewer(palette="Set2", labels = c("Threshold-based", "T-CNN")) +
+  scale_fill_manual(values = cols) +
+  labs(x = "Recall", y = "Ground truth segments taxonomic group", fill = "Segmentation \npipeline") +
+  scale_y_discrete(breaks = unique(recall_taxo$taxon), labels = unique(recall_taxo$class_label)) +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  theme_classic() +
+  theme(axis.text.y = element_text(hjust = 1), text = element_text(size = 15), legend.position = "top", legend.justification='left', plot.margin = margin(0, 0.5, 0, 0, "cm"))
 
 ```
 
-## Compute statistics per size class
+**T-CNN segmentation is less performant on Bacillariophycaea (looks like fibers), Doliolida and Actinopterygii. MSER segmentation is less performant on Acantharea, Rhizaria, Bacillariophycaea, Ctenophora and Ostracoda (mostly small objects).**
 
-We will define size classes for particles:
+## Compute statistics per class size
 
-* [50 px,100 px)  
-* [100 px, 150 px) 
-* [150 px, 200 px) 
-* [200 px, 250 px) 
-* [250 px, 300 px) 
-* [300 px, 350 px) 
-* [350 px, 400 px) 
-* [400 px, 450 px) 
-* [450 px, 500 px) 
-* \> 500 px
+We will define class size for particles using the length of the diagonal of their bbox:
 
-And compute recall for each size class.
+* [0 px, 10 px)  
+* [10 px, 20 px) 
+* [20 px, 30 px) 
+* [30 px, 40 px) 
+* [40 px, 50 px) 
+* [50 px, 60 px) 
+* [60 px, 70 px) 
+* [70 px, 80 px) 
+* [80 px, 90 px) 
+* [90 px, 100 px) 
+* \> 100 px
 
+And compute recall for each class size.
+
+
+```{r cut_size}
+# Define class sizees for bbox diagonal
+# - 10 px from 0 px to 100 px
+# - larger than 100 px
+my_breaks <- c(seq(from = 0, to = 100, by = 10), 1000000)
+#my_breaks <- c(seq(from = 0, to = 2, by = 0.2), 20000)
+#my_breaks <- my_breaks * 0.051
+man_parts <- man_parts %>% mutate(size_class = cut(diag_bbox, breaks = my_breaks, right = FALSE))
+
+man_parts %>% 
+  count(size_class) %>% 
+  ggplot() +
+  geom_col(aes(y = size_class, x = n))
+```
+
+The most represented class size is [20 px, 30 px).
 
 ```{r size_stats}
-# Define size classes
-# - 50 px from 50 px to 500 px
-# - larger than 500 px
-man_parts <- man_parts %>% 
-  mutate(class_size = cut(area, breaks = c(0, seq(from = 50, to = 500, by = 50), 1000000), right = FALSE))
-
 ## Regular particles
 # Count matches 
 counts_reg_size <- matches_reg %>% 
@@ -375,14 +450,14 @@ counts_reg_size <- matches_reg %>%
   # join matched regular particles with manual particles class size
   left_join(man_parts, by = c("man_ids" = "object_id")) %>% 
    # count matches per class size
-  count(class_size, name = "n_reg")
+  count(size_class, name = "n_reg")
 
 # Compute recall
 recall_reg_size <- man_parts %>% 
   # count true particles per class size
-  count(class_size, name = "n_truth") %>% 
+  count(size_class, name = "n_truth") %>% 
   # join with semantic matched particles
-  left_join(counts_reg_size, by = "class_size") %>% 
+  left_join(counts_reg_size, by = "size_class") %>% 
   # compute ratio of regular matched particles over true particles (recall)
   mutate(recall_reg = n_reg / n_truth) 
 
@@ -397,61 +472,85 @@ counts_sem_size <- matches_sem %>%
   # join matched semantic particles with manual particles class size
   left_join(man_parts, by = c("man_ids" = "object_id")) %>% 
   # count matches per class size
-  count(class_size, name = "n_sem")
+  count(size_class, name = "n_sem")
 
 # Compute recall
 recall_sem_size <- man_parts %>% 
   # count true particles per class size
-  count(class_size, name = "n_truth") %>% 
+  count(size_class, name = "n_truth") %>% 
   # join with semantic matched particles
-  left_join(counts_sem_size, by = "class_size") %>% 
+  left_join(counts_sem_size, by = "size_class") %>% 
   # compute ratio of semantic matched particles over true particles (recall)
   mutate(recall_sem = n_sem / n_truth) 
+
+## MSER particles
+# Count matches 
+counts_mser_size <- matches_mser %>% 
+   # drop all cases of duplicated matches of apeep particles in match table (solve case 1 of multiple matches)
+  add_count(mser_ids) %>% filter(n==1) %>% select(-n) %>%
+  # drop duplicates of matched manual particles and keep only one (solve case 2 of multiple matches)
+  distinct(man_ids, .keep_all = TRUE) %>% 
+  # join matched MSER particles with manual particles class size
+  left_join(man_parts, by = c("man_ids" = "object_id")) %>% 
+  # count matches per class size
+  count(size_class, name = "n_mser")
+
+# Compute recall
+recall_mser_size <- man_parts %>% 
+  # count true particles per class size
+  count(size_class, name = "n_truth") %>% 
+  # join with MSER matched particles
+  left_join(counts_mser_size, by = "size_class") %>% 
+  # compute ratio of MSER matched particles over true particles (recall)
+  mutate(recall_mser = n_mser / n_truth) 
 
 
 # Join regular and semantic recall data and plot
 recall_size <- recall_reg_size %>% 
-  left_join(recall_sem_size, by = c("class_size", "n_truth")) %>% 
-  select(class_size, n_truth, contains("recall")) %>% 
-  gather(recall_reg:recall_sem, key = "segmentation", value = "recall") 
+  left_join(recall_sem_size, by = c("size_class", "n_truth")) %>% 
+  left_join(recall_mser_size, by = c("size_class", "n_truth")) %>% 
+  select(size_class, n_truth, contains("recall")) %>% 
+  gather(recall_reg:recall_mser, key = "segmentation", value = "recall") %>% 
+  mutate(class_label = paste(size_class, "\nn =", n_truth))
 
+# Add number of objects to class label
+recall_size <- recall_size %>% 
+  mutate(
+    class_label = paste0(size_class, "\nn=", n_truth),
+    class_label = factor(class_label, levels = unique(class_label))
+    ) 
+
+# Plot
 recall_size %>% 
+    mutate(
+    segmentation = str_remove(segmentation, "recall_"),
+    segmentation = ifelse(segmentation == "reg", "T", ifelse(segmentation == "sem", "T-CNN", "T-MSER")),
+    segmentation = factor(segmentation, levels = c("T", "T-MSER", "T-CNN"))
+    ) %>% 
   ggplot() +
-  geom_col(aes(x = class_size, y = n_truth, fill = recall), position = "dodge") +
-  scale_fill_viridis_c(direction = -1) + 
-  scale_y_continuous(trans = "log1p") +
-  coord_flip() +
-  facet_wrap(~segmentation, labeller = as_labeller(c("recall_reg" = "Regular segmentation", "recall_sem" = "Semantic segmentation"))) +
-  labs(title = "Recall scores and organisms number per size class for each segmentation", fill = "Recall", 
-       x = "Size class (px)", y = "Number of \ntrue objects") +
-  theme(text = element_text(size = 16)) 
+  geom_col(aes(y = size_class, x = recall, fill = factor(segmentation, levels = rev(levels(segmentation)))), position = "dodge", show.legend = FALSE) + 
+  geom_hline(yintercept = 2.5, color = "darkgray", linetype = "dotted") +
+  #geom_segment(aes(x = 0, y = 2.5, xend = 1, yend = 2.5), color = "darkgray", linetype = "dotted") +
+  #scale_fill_brewer(palette="Set2", labels = c("Threshold-based", "T-CNN")) +
+  scale_fill_manual(values = cols) +
+  labs(x = "Recall", y = "Ground-truth segments bounding box diagonal (px)", fill = "Segmentation pipeline") +
+  scale_y_discrete(breaks = unique(recall_size$size_class), labels = unique(recall_size$class_label)) +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  theme_classic() +
+  theme(axis.text.y = element_text(hjust = 1), text = element_text(size = 15), plot.margin = margin(0, 0.5, 0, 0, "cm"))
 ```
 
-Other plot.
+**The threshold-based segmentation hos a lower recall on large objects. For the T-CNN pipeline, recall does not vary much across class-size. The MSER segmentation has a lower recall both on large and small objects. ** 
 
-```{r size_plot, echo=FALSE}
-recall_size %>% 
-  ggplot() +
-  geom_col(aes(x = class_size, y = recall, fill = n_truth)) + 
-  scale_fill_viridis_c(trans = "log1p", direction = -1) + 
-  coord_flip() +
-  facet_wrap(~segmentation, labeller = as_labeller(c("recall_reg" = "Regular segmentation", "recall_sem" = "Semantic segmentation"))) +
-  labs(title = "Recall scores and organisms number per size class for each segmentation", fill = "Number of \ntrue objects", x = "Size class (px)") +
-  theme(text = element_text(size = 16)) 
-
-```
-
-
-
-
-Now compute precision on each size class.
+Now compute precision on each class size.
 
 ```{r size_prec}
-# Define size classes
+# Define class size
 # - 50 px from 50 px to 500 px
 # - larger than 500 px
-reg_parts <- reg_parts %>% mutate(class_size = cut(object_area, breaks = c(0, seq(from = 50, to = 500, by = 50), 1000000), right = FALSE))
-sem_parts <- sem_parts %>% mutate(class_size = cut(object_area, breaks = c(0, seq(from = 50, to = 500, by = 50), 1000000), right = FALSE))
+reg_parts <- reg_parts %>% mutate(size_class = cut(diag_bbox, breaks = my_breaks, right = FALSE))
+sem_parts <- sem_parts %>% mutate(size_class = cut(diag_bbox, breaks = my_breaks, right = FALSE))
+mser_parts <- mser_parts %>% mutate(size_class = cut(diag_bbox, breaks = my_breaks, right = FALSE))
 
 ## Regular particles
 # Count matches 
@@ -463,14 +562,14 @@ counts_reg_size <- matches_reg %>%
   # join matched regular particles with regular particles class size
   left_join(reg_parts, by = c("reg_ids" = "object_id")) %>% 
    # count matches per class size
-  count(class_size, name = "n_match")
+  count(size_class, name = "n_match")
 
 # Compute recall
 precision_reg_size <- reg_parts %>% 
   # count true particles per class size
-  count(class_size, name = "n_reg") %>% 
+  count(size_class, name = "n_reg") %>% 
   # join with semantic matched particles
-  left_join(counts_reg_size, by = "class_size") %>% 
+  left_join(counts_reg_size, by = "size_class") %>% 
   # compute ratio of regular matched particles over true particles (recall)
   mutate(precision_reg = n_match / n_reg) 
 
@@ -485,113 +584,230 @@ counts_sem_size <- matches_sem %>%
   # join matched semantic particles with semantic particles class size
   left_join(sem_parts, by = c("sem_ids" = "object_id")) %>% 
   # count matches per class size
-  count(class_size, name = "n_match")
+  count(size_class, name = "n_match")
 
 # Compute recall
 precision_sem_size <- sem_parts %>% 
   # count true particles per class size
-  count(class_size, name = "n_sem") %>% 
+  count(size_class, name = "n_sem") %>% 
   # join with semantic matched particles
-  left_join(counts_sem_size, by = "class_size") %>% 
+  left_join(counts_sem_size, by = "size_class") %>% 
   # compute ratio of semantic matched particles over true particles (recall)
   mutate(precision_sem = n_match / n_sem) 
+
+
+## MSER particles
+# Count matches 
+counts_mser_size <- matches_mser %>% 
+   # drop all cases of duplicated matches of apeep particles in match table (solve case 1 of multiple matches)
+  add_count(mser_ids) %>% filter(n==1) %>% select(-n) %>%
+  # drop duplicates of matched manual particles and keep only one (solve case 2 of multiple matches)
+  distinct(man_ids, .keep_all = TRUE) %>% 
+  # join matched MSER particles with MSER particles class size
+  left_join(mser_parts, by = c("mser_ids" = "object_id")) %>% 
+  # count matches per class size
+  count(size_class, name = "n_match")
+
+# Compute recall
+precision_mser_size <- mser_parts %>% 
+  # count true particles per class size
+  count(size_class, name = "n_mser") %>% 
+  # join with MSER matched particles
+  left_join(counts_mser_size, by = "size_class") %>% 
+  # compute ratio of MSER matched particles over true particles (recall)
+  mutate(precision_mser = n_match / n_mser) 
 
 
 # Join regular and semantic recall data and plot
 precision_size <- precision_reg_size %>% 
   select(-c(n_reg, n_match)) %>% 
-  left_join(precision_sem_size %>% select(-c(n_sem, n_match)), by = "class_size") %>% 
-  left_join(man_parts %>% count(class_size, name = "n_truth"),  by = "class_size") %>% 
-  select(class_size, n_truth, contains("precision")) %>% 
-  gather(precision_reg:precision_sem, key = "segmentation", value = "precision") 
+  left_join(precision_sem_size %>% select(-c(n_sem, n_match)), by = "size_class") %>% 
+  left_join(precision_mser_size %>% select(-c(n_mser, n_match)), by = "size_class") %>% 
+  left_join(man_parts %>% count(size_class, name = "n_truth"),  by = "size_class") %>% 
+  select(size_class, n_truth, contains("precision")) %>% 
+  gather(precision_reg:precision_mser, key = "segmentation", value = "precision") 
 
+# Plot it
 precision_size %>% 
+  mutate(
+    segmentation = str_remove(segmentation, "precision_"),
+    segmentation = ifelse(segmentation == "reg", "T", ifelse(segmentation == "sem", "T-CNN", "T-MSER")),
+    segmentation = factor(segmentation, levels = c("T", "T-MSER", "T-CNN"))
+    ) %>% 
   ggplot() +
-  geom_col(aes(x = class_size, y = n_truth, fill = precision), position = "dodge") +
-  scale_fill_viridis_c(direction = -1) + 
-  scale_y_continuous(trans = "log1p") +
-  coord_flip() +
-  facet_wrap(~segmentation, labeller = as_labeller(c("precision_reg" = "Regular segmentation", "precision_sem" = "Semantic segmentation"))) +
-  labs(title = "Precision scores and organisms number per size class for each segmentation", fill = "Precision", 
-       x = "Size class (px)", y = "Number of \ntrue objects") +
-  theme(text = element_text(size = 16)) 
+  geom_col(aes(y = size_class, x = precision, fill = factor(segmentation, levels = rev(levels(segmentation)))), position="dodge") + 
+  scale_fill_manual(values = cols) +
+  labs(x = "Precision", y = "Automated segments bounding box diagonal (px)", fill = "Segmentation \npipeline") +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  theme_classic() +
+  theme(axis.text.y = element_text(hjust = 1), text = element_text(size = 15), plot.margin = margin(0, 0.5, 0, 0, "cm"), legend.position = c(0.7, 0.75))
 ```
 
+**The threshold-based pipeline has a poor precision across all class sizes, but this is even worse for the smallest objects. The T-CNN pipeline has an improved precision on the lower end of the size range, where it relies on CNN object detection. The MSER segmentation has a better precision than the threshord-based pipeline on all classes, especially for larger objects. ** 
 
-Other plot.
-
-```{r size_prec_plot, echo=FALSE}
-precision_size %>% 
-  ggplot() +
-  geom_col(aes(x = class_size, y = precision, fill = n_truth)) + 
-  scale_fill_viridis_c(trans = "log1p", direction = -1) + 
-  coord_flip() +
-  facet_wrap(~segmentation, labeller = as_labeller(c("precision_reg" = "Regular segmentation", "precision_sem" = "Semantic segmentation"))) +
-  labs(title = "Precision scores and organisms number per size class for each segmentation", fill = "Number of \ntrue objects", x = "Size class (px)") +
-  theme(text = element_text(size = 16)) 
-
-```
+## Investigate size distribution of segmented particles
 
 
+### NBSS
 
-## Investigate size distribution of particles for both segmentation pipelines
+```{r part_size, fig.height=4, fig.width=8}
+library(nbssr)
 
-```{r area_dens}
 area_dist <- bind_rows(
   sem_parts %>% mutate(segmentation = "semantic"),
   reg_parts %>% mutate(segmentation = "regular"),
-  man_parts %>% mutate(segmentation = "manual"),
+  mser_parts %>% mutate(segmentation = "mser"),
+  man_parts %>% select(colnames(sem_parts)) %>% mutate(segmentation = "manual"),
 )
-area_dist %>% 
-  ggplot() +
-  geom_density(aes(x = object_area, color = segmentation)) +
-  scale_x_log10()
-```
 
-We see the difference of segmentation method for the semantic pipeline. Let’s plot a histogram.
-
-```{r area_hist}
-area_dist %>% 
-  ggplot() +
-  geom_histogram(aes(x = object_area, fill = segmentation), position = "dodge") +
-  scale_x_log10()
-```
-
-We can use these values to compute the proportion of objects to sample in each class size for plankton and detritus to generate a realistic dataset of semantic particles.
-
-```{r area_counts}
-area_sample <- area_dist %>% 
-  group_by(class_size, segmentation) %>% # count particles per segmentation per class size
-  summarise(n_part = n()) %>% 
-  ungroup() %>% 
-  spread(key = "segmentation", value = "n_part") %>% 
-  left_join( # add recall per class size for each segmentation
-    recall_size %>% 
-    select(-n_truth) %>% 
-    spread(key= "segmentation", value = "recall"),
-    by = "class_size"
-  ) %>% 
-  select(class_size, manual, regular, recall_reg, semantic, recall_sem) %>% 
+isiis <- area_dist %>% 
   mutate(
-    plankton_reg = round(recall_reg*manual), # nb of plankton particles among regular particles
-    detritus_reg = regular - plankton_reg,   # nb of detritus particles among regular particles
-    plankton_sem = round(recall_sem*manual), # nb of plankton particles among semantic particles
-    detritus_sem = semantic - plankton_sem,  # nb of detritus particles among semantic particles
-    plankton_sem_reg = plankton_sem / plankton_reg, # proportion of plankton particles to sample among regular particles
-    detritus_sem_reg = detritus_sem / detritus_reg  # proportion of detritus particles to sample among semantic particles
-  ) %>% 
-  select(class_size, manual, plankton = plankton_sem_reg, detritus = detritus_sem_reg)
+    esd = 2*sqrt(area/pi),
+    diag_bbox_mm = diag_bbox * 0.051 # 1 px = 51 µm = 0.051 mm
+    ) %>% 
+  left_join(man_parts %>% select(acq_id, datetime, dist) %>% unique(), by = "acq_id") # and add particles metadata
 
-area_sample %>% 
-  gather(plankton:detritus, key = "part", value = "to_sample") %>% 
-  ggplot() +
-  geom_col(aes(x = class_size, y = to_sample, fill = part), position = "dodge") +
-  labs(y = "Proportion of particles to sample", title = "Proportion of particles to sample from regular test set in each 50 px class size.")
+ss <- bind_rows(
+  nbss(isiis %>% filter(segmentation == "manual")   %>% pull(diag_bbox_mm), type = "abundance", base = 2, binwidth = 0.1) %>% mutate(segmentation = "manual"),
+  nbss(isiis %>% filter(segmentation == "regular")  %>% pull(diag_bbox_mm), type = "abundance", base = 2, binwidth = 0.1) %>% mutate(segmentation = "regular"),
+  nbss(isiis %>% filter(segmentation == "semantic") %>% pull(diag_bbox_mm), type = "abundance", base = 2, binwidth = 0.1) %>% mutate(segmentation = "semantic"),
+  nbss(isiis %>% filter(segmentation == "mser")     %>% pull(diag_bbox_mm), type = "abundance", base = 2, binwidth = 0.1) %>% mutate(segmentation = "mser")
+) %>% 
+  as_tibble()
+
+ss <- ss %>% 
+  rename(bin_mm = bin) %>% 
+  mutate(bin_px = bin_mm / 0.051)
+
+cols <- c(
+  "manual" = "#e78ac3", # for manual
+  "regular" = "#66c2a5", # for threshold-based
+  "mser" = "#fc8d62", # for MSER
+  "semantic" = "#8da0cb" # for T-CNN
+)
+
+ggplot(ss, aes(x=bin_mm, y=norm_y, color = segmentation)) +
+  geom_path() +
+  scale_color_manual(values = cols, labels = c("Ground-truth", "T", "T-MSER", "T-CNN")) +
+  scale_x_log10() +
+  scale_y_log10(labels = scales::scientific) +
+  annotation_logticks(
+    sides="b", 
+    outside=TRUE,
+    short = unit(.5,"mm"),
+    mid = unit(1,"mm"),
+    long = unit(1,"mm")
+    ) +
+  coord_cartesian(clip = "off") +
+  labs(x = "Bounding box diagonal (mm)", y = "Normalised abundance (mm<sup>-1</sup>)", color = "Pipeline") +
+  theme_classic() +
+  theme(axis.title.y = element_markdown(), text = element_text(size = 15), plot.margin = margin(0, 0.1, 0, 0, "cm"), legend.position = c(0.8, 0.75))
+ 
+```
+
+
+Compute slope of size spectra for points between 30 and 500 in x.
+
+```{r ss_slope}
+library(ggpubr)
+library(rstatix)
+library(broom)
+
+df <- ss %>% 
+  filter(between(bin_px, 30, 500)) %>% 
+  mutate(
+    bin_log = log(bin_px),
+    norm_y_log = log(norm_y),
+    ) %>% 
+  select(segmentation, bin_log, norm_y_log) 
+
+
+# Plot each group
+ggscatter(df, x = "bin_log", y = "norm_y_log", color = "segmentation", add = "reg.line") +
+  stat_regline_equation(
+    aes(label =  paste(..eq.label.., ..rr.label.., sep = "~~~~"), color = segmentation), label.x.npc = "center"
+    ) 
 
 ```
 
-```{r area_sample}
-write_csv(area_sample, "data/03.semantic_area_to_sample.csv")
-area_sample %>% rename(nb_manual = manual, plankton_sample=plankton, detritus_sample=detritus)
+
+```{r ancova_checks}
+# Look for interaction between covariable and group variable
+df %>% anova_test(norm_y_log ~ segmentation*bin_log)
+# Not OK: there is an interaction
+
+#aov(bin_log ~ segmentation, data = df)
+
+# Normality of residuals
+# Calculer le modèle, la covariable passe en premier
+model <- lm(norm_y_log ~ bin_log + segmentation, data = df)
+
+fit2 <- aov(norm_y_log ~ bin_log + segmentation, df)
+summary(fit2)
+car::Anova(fit2, type="III")
+
+# Inspecter les paramètres de diagnostic du modèle
+model.metrics <- augment(model) %>%
+  select(-.hat, -.sigma, -.fitted) # Supprimer les détails
+head(model.metrics, 3)
+# Évaluer la normalité des résidus à l'aide du test de Shapiro-Wilk
+shapiro_test(model.metrics$.resid)
+# OK for normality of residuals
+
+# Check for variance homogeneity
+model.metrics %>% levene_test(.resid ~ segmentation)
+# OK
+
+# Look for outliers
+model.metrics %>% 
+  filter(abs(.std.resid) > 3) %>%
+  as.data.frame()
+# OK: no outlier
 ```
+
+
+```{r ancova}
+# ANCOVA computation
+res.aov <- df %>% anova_test(norm_y_log ~ bin_log + segmentation)
+get_anova_table(res.aov)
+# Significant difference between slopes
+```
+
+
+```{r ancova_pairs}
+# Test post-hoc for pairs
+# Comparaisons par paires
+library(emmeans)
+pwc <- df %>% 
+  emmeans_test(
+    norm_y_log ~ segmentation, covariate = bin_log,
+    p.adjust.method = "bonferroni"
+    )
+pwc
+```
+
+```{r ancova_plot}
+# Visualisation : Line plots avec p-values
+pwc <- pwc %>% add_xy_position(x = "segmentation", fun = "mean_se")
+ggline(get_emmeans(pwc), x = "segmentation", y = "emmean") +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) + 
+  stat_pvalue_manual(pwc, hide.ns = TRUE, tip.length = FALSE) +
+  labs(
+    subtitle = get_test_label(res.aov, detailed = TRUE),
+    caption = get_pwc_label(pwc)
+  )
+```
+
+Other test for slopes differences
+
+```{r test_slope}
+mod1 <- aov(bin_log ~ norm_y_log*segmentation, data = df)
+summary(mod1)
+mod2 <- aov(bin_log ~ norm_y_log + segmentation, data = df)
+summary(mod2)
+anova(mod1,mod2)
+# Model is affected when interaction is removed, slopes are different
+```
+
+
 
