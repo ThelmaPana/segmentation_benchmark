@@ -4,13 +4,9 @@
 Code for: **Content-aware segmentation of objects spanning a large size range: application to plankton images**
 
 Thelma Panaïotis
-<<<<<<< HEAD
 
 PhD student
 
-=======
-PhD student
->>>>>>> 8e19b82e4682bc40853afd570454e59173661c52
 Laboratoire d’Océanographie de Villefranche (UMR 7093)
 
 ***
